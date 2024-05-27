@@ -1,129 +1,438 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Plantilla de CloudFormation para desplegar una aplicación de WordPress en AWS.
-
-Parameters:
-  VpcCIDR:
-    Description: CIDR block para la VPC
-    Type: String
-    Default: "10.0.0.0/16"
+Description: WordPress on ECS with EC2 instances, ALB, NAT Gateway, ECR, Secrets
+  Manager, and EFS
 
 Resources:
-  VPC:
+  SkyAlertNewsVPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: !Ref VpcCIDR
+      CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-vpc
 
-  InternetGateway:
+  SkyAlertNewsPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SkyAlertNewsVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-public-subnet
+
+  SkyAlertNewsPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SkyAlertNewsVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-private-subnet
+
+  SkyAlertNewsInternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-igw
 
-  AttachGateway:
+  SkyAlertNewsAttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref SkyAlertNewsVPC
+      InternetGatewayId: !Ref SkyAlertNewsInternetGateway
 
-  PublicSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: "10.0.0.0/24"
-      AvailabilityZone: !Select [ 0, !GetAZs '' ]
-
-  PrivateSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: "10.0.1.0/24"
-      AvailabilityZone: !Select [ 0, !GetAZs '' ]
-
-  PublicRouteTable:
+  SkyAlertNewsPublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref VPC
+      VpcId: !Ref SkyAlertNewsVPC
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-public-route-table
 
-  RouteToInternetGateway:
+  SkyAlertNewsPublicRoute:
     Type: AWS::EC2::Route
-    DependsOn: AttachGateway
+    DependsOn: SkyAlertNewsAttachGateway
     Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: "0.0.0.0/0"
-      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref SkyAlertNewsPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref SkyAlertNewsInternetGateway
 
-  PublicSubnetRouteTableAssociation:
+  SkyAlertNewsPublicSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SkyAlertNewsPublicSubnet
+      RouteTableId: !Ref SkyAlertNewsPublicRouteTable
 
-  SecurityGroup:
+  SkyAlertNewsNatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  SkyAlertNewsNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt SkyAlertNewsNatGatewayEIP.AllocationId
+      SubnetId: !Ref SkyAlertNewsPublicSubnet
+
+  SkyAlertNewsPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SkyAlertNewsVPC
+      Tags:
+        - Key: Name
+          Value: SkyAlertNews-private-route-table
+
+  SkyAlertNewsPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref SkyAlertNewsPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref SkyAlertNewsNatGateway
+
+  SkyAlertNewsPrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SkyAlertNewsPrivateSubnet
+      RouteTableId: !Ref SkyAlertNewsPrivateRouteTable
+
+  SkyAlertNewsECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: SkyAlertNews-ecs-cluster
+
+  SkyAlertNewsECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - ec2:Describe*
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+
+  SkyAlertNewsEC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ecs-instance
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - logs:*
+                Resource: '*'
+
+  SkyAlertNewsECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SkyAlertNewsEC2InstanceRole
+
+  SkyAlertNewsLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref SkyAlertNewsECSInstanceProfile
+      ImageId: ami-0d94353f7bad10668
+      InstanceType: t2.micro
+      KeyName: SkyAlertNews-KeyPair
+      SecurityGroups:
+        - !Ref SkyAlertNewsInstanceSecurityGroup
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          echo ECS_CLUSTER=${SkyAlertNewsECSCluster} >> /etc/ecs/ecs.config
+
+  SkyAlertNewsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SkyAlertNewsPublicSubnet
+      LaunchConfigurationName: !Ref SkyAlertNewsLaunchConfiguration
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref SkyAlertNewsALBTargetGroupHTTP
+        - !Ref SkyAlertNewsALBTargetGroupHTTPS
+
+  SkyAlertNewsALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: SkyAlertNews-alb
+      Subnets:
+        - !Ref SkyAlertNewsPublicSubnet
+      SecurityGroups:
+        - !Ref SkyAlertNewsALBSecurityGroup
+      Scheme: internet-facing
+
+  SkyAlertNewsALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SkyAlertNewsALBTargetGroupHTTP
+      LoadBalancerArn: !Ref SkyAlertNewsALB
+      Port: 80
+      Protocol: HTTP
+
+  SkyAlertNewsALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SkyAlertNewsALBTargetGroupHTTPS
+      LoadBalancerArn: !Ref SkyAlertNewsALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: arn:aws:acm:region:account-id:certificate/certificate-id # Replace with your certificate ARN
+
+  SkyAlertNewsALBTargetGroupHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref SkyAlertNewsVPC
+
+  SkyAlertNewsALBTargetGroupHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTPS
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200
+      Port: 443
+      Protocol: HTTPS
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref SkyAlertNewsVPC
+
+  SkyAlertNewsInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Permitir tráfico HTTP y SSH
-      VpcId: !Ref VPC
+      GroupDescription: SkyAlertNews ECS Instances
+      VpcId: !Ref SkyAlertNewsVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
 
-  LoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  SkyAlertNewsALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      Scheme: internet-facing
-      Subnets:
-        - !Ref PublicSubnet
+      GroupDescription: SkyAlertNews ALB
+      VpcId: !Ref SkyAlertNewsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  SkyAlertNewsECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: skyalertnews-wordpress
+
+  SkyAlertNewsECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: SkyAlertNews-WordPress
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt SkyAlertNewsECSServiceRole.Arn
+      TaskRoleArn: !GetAtt SkyAlertNewsECSServiceRole.Arn
+      ContainerDefinitions:
+        - Name: wordpress
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/skyalertnews-wordpress:latest
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+          Environment:
+            - Name: WORDPRESS_DB_HOST
+              Value: !GetAtt SkyAlertNewsDBInstance.Endpoint.Address
+            - Name: WORDPRESS_DB_USER
+              Value: !Ref SkyAlertNewsDBUser
+            - Name: WORDPRESS_DB_PASSWORD
+              Value: !Sub '{{resolve:secretsmanager:${SkyAlertNewsDBPassword}:SecretString:password}}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/skyalertnews-wordpress
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  SkyAlertNewsECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref SkyAlertNewsECSCluster
+      DesiredCount: 2
+      LaunchType: EC2
+      TaskDefinition: !Ref SkyAlertNewsECSTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SkyAlertNewsPrivateSubnet
+          SecurityGroups:
+            - !Ref SkyAlertNewsInstanceSecurityGroup
+      LoadBalancers:
+        - ContainerName: wordpress
+          ContainerPort: 80
+          TargetGroupArn: !Ref SkyAlertNewsALBTargetGroupHTTP
+
+  SkyAlertNewsDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SkyAlertNews RDS Access
+      VpcId: !Ref SkyAlertNewsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref SkyAlertNewsInstanceSecurityGroup
+
+  SkyAlertNewsDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SkyAlertNews RDS Subnet Group
+      SubnetIds:
+        - !Ref SkyAlertNewsPrivateSubnet
+      DBSubnetGroupName: skyalertnews-rds-subnet-group
+
+  SkyAlertNewsDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      DBInstanceClass: db.t2.micro
+      Engine: MySQL
+      EngineVersion: '5.7'
+      MasterUsername: !Ref SkyAlertNewsDBUser
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${SkyAlertNewsDBPassword}:SecretString:password}}'
+      VPCSecurityGroups:
+        - !Ref SkyAlertNewsDBSecurityGroup
+      DBSubnetGroupName: !Ref SkyAlertNewsDBSubnetGroup
+
+  SkyAlertNewsDBUser:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: SkyAlertNewsDBUser
+      Type: String
+      Value: wordpress
+
+  SkyAlertNewsDBPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: SkyAlertNewsDBPassword
+      SecretString: !Sub '{"username":"wordpress","password":"MySecurePass"}'
+      Description: Password for WordPress RDS instance
+
+  SkyAlertNewsEFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+
+  SkyAlertNewsEFSMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref SkyAlertNewsEFSFileSystem
+      SubnetId: !Ref SkyAlertNewsPrivateSubnet
       SecurityGroups:
-        - !Ref SecurityGroup
-      Tags:
-        - Key: Name
-          Value: WordPressLoadBalancer
-
-  TargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref VPC
-      Port: 80
-      Protocol: HTTP
-      TargetType: ip
-      HealthCheckIntervalSeconds: 30
-      HealthCheckPath: /
-      HealthCheckProtocol: HTTP
-      Matcher:
-        HttpCode: 200
-
-  Listener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref TargetGroup
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
-
-  ECSCluster:
-    Type: AWS::ECS::Cluster
-
-  ExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: "Allow"
-            Principal:
-              Service: "ecs-tasks.amazonaws.com"
-            Action: "sts:AssumeRole"
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - !Ref SkyAlertNewsInstanceSecurityGroup
 
 Outputs:
+  VPCId:
+    Description: VPC Id
+    Value: !Ref SkyAlertNewsVPC
+  PublicSubnetId:
+    Description: Public Subnet Id
+    Value: !Ref SkyAlertNewsPublicSubnet
+  PrivateSubnetId:
+    Description: Private Subnet Id
+    Value: !Ref SkyAlertNewsPrivateSubnet
+  ECSCluster:
+    Description: ECS Cluster Name
+    Value: !Ref SkyAlertNewsECSCluster
   LoadBalancerDNSName:
-    Description: DNS name del Application Load Balancer
-    Value: !GetAtt LoadBalancer.DNSName
+    Description: DNS Name of the Load Balancer
+    Value: !GetAtt SkyAlertNewsALB.DNSName
+  RDSInstanceEndpoint:
+    Description: RDS Endpoint
+    Value: !GetAtt SkyAlertNewsDBInstance.Endpoint.Address
+  EFSFileSystemId:
+    Description: EFS File System Id
+    Value: !Ref SkyAlertNewsEFSFileSystem
